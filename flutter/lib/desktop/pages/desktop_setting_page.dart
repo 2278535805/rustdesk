@@ -591,6 +591,13 @@ class _GeneralState extends State<_General> {
           isServer: false,
         ),
       ],
+      if (!isWeb)
+        _OptionCheckBox(
+          context,
+          translate('Enable NAT port prediction'),
+          kOptionAllowNatPrediction,
+          isServer: true,
+        ),
       if (!incomingOnly) ...webrtcOptions(context),
       if (!isWeb && !incomingOnly)
         Tooltip(

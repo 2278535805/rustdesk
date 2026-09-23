@@ -45,8 +45,8 @@ pub const SOCKETS: usize = 2;
 
 pub fn enabled() -> bool {
     option2bool(
-        keys::OPTION_ENABLE_NAT_PREDICTION,
-        &Config::get_option(keys::OPTION_ENABLE_NAT_PREDICTION),
+        keys::OPTION_ALLOW_NAT_PREDICTION,
+        &Config::get_option(keys::OPTION_ALLOW_NAT_PREDICTION),
     )
 }
 

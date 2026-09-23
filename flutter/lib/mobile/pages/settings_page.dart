@@ -103,6 +103,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
   var _disableUdp = false;
   var _enableIpv6Punch = false;
   var _enableWebrtc = false;
+  var _allowNatPrediction = false;
   var _isUsingPublicServer = false;
   var _allowAskForNoteAtEndOfConnection = false;
   var _preventSleepWhileConnected = true;
@@ -147,6 +148,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     _enableUdpPunch = mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
     _enableIpv6Punch = mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
     _enableWebrtc = mainGetLocalBoolOptionSync(kOptionEnableWebrtc);
+    _allowNatPrediction = mainGetBoolOptionSync(kOptionAllowNatPrediction);
     _allowAskForNoteAtEndOfConnection =
         mainGetLocalBoolOptionSync(kOptionAllowAskForNoteAtEndOfConnection);
     _preventSleepWhileConnected =
@@ -879,6 +881,20 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                       });
                     },
             ),
+          SettingsTile.switchTile(
+            title: Text(translate('Enable NAT port prediction')),
+            initialValue: _allowNatPrediction,
+            onToggle: isOptionFixed(kOptionAllowNatPrediction)
+                ? null
+                : (v) async {
+                    await mainSetBoolOption(kOptionAllowNatPrediction, v);
+                    final newValue =
+                        mainGetBoolOptionSync(kOptionAllowNatPrediction);
+                    setState(() {
+                      _allowNatPrediction = newValue;
+                    });
+                  },
+          ),
           SettingsTile(
               title: Text(translate('Language')),
               leading: Icon(Icons.translate),
