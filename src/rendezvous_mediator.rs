@@ -1094,13 +1094,31 @@ impl RendezvousMediator {
         } else {
             String::new()
         };
+        // Port prediction: the controller sampled its external UDP ports and sent
+        // them along, so a symmetric NAT's next allocations can be probed instead
+        // of relayed. Only the controller opts in (an empty sample list means it
+        // did not), and only when both ends can still punch.
+        let predict_window = if crate::nat_predict::enabled()
+            && ph.udp_port > 0
+            && !ph.ext_ports.is_empty()
+            && ph.webrtc_sdp_offer.is_empty()
+            && !local_proxy
+            && !ph.force_relay
+        {
+            let mut samples = ph.ext_ports.clone();
+            samples.push(ph.udp_port);
+            crate::nat_predict::predict_port_window(&samples)
+        } else {
+            None
+        };
         // Whether the v4 legs relay is known here, and decides whether a v4 place is taken at
         // all: the relay branch below runs the whole session, and a place held across it would
         // let ordinary relay traffic use the pool up. The v6 punch is not relayed with them - a
         // symmetric NAT on v4 says nothing about v6 - and its place is taken after the v4 one,
         // or it could be the last and leave the punch the peer counts on with none.
-        let relay_v4 = ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
-            || Config::get_nat_type() == NatType::SYMMETRIC as i32
+        let relay_v4 = (ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
+            || Config::get_nat_type() == NatType::SYMMETRIC as i32)
+            && predict_window.is_none()
             || relay
             || (config::is_disable_tcp_listen() && ph.udp_port <= 0);
         let punch_udp = !relay_v4 && ph.udp_port > 0;
@@ -1143,6 +1161,63 @@ impl RendezvousMediator {
         }
         use hbb_common::protobuf::Enum;
         let nat_type = NatType::from_i32(Config::get_nat_type()).unwrap_or(NatType::UNKNOWN_NAT);
+        if let Some(window) = predict_window {
+            let Some(slot) = slot_udp else {
+                hbb_common::throttled_log!(
+                    PUNCH_LOG_INTERVAL,
+                    warn,
+                    "declined a predictive punch: {} UDP punches already in flight",
+                    UDP_PUNCHES.max
+                );
+                let uuid = Uuid::new_v4().to_string();
+                return self
+                    .create_relay(
+                        ph.socket_addr.into(),
+                        relay_server,
+                        uuid,
+                        server,
+                        true,
+                        true,
+                        socket_addr_v6,
+                        webrtc_sdp_answer,
+                        meta,
+                    )
+                    .await;
+            };
+            let msg_punch = PunchHoleSent {
+                socket_addr: ph.socket_addr.clone(),
+                id: Config::get_id(),
+                relay_server: relay_server.clone(),
+                nat_type: nat_type.into(),
+                version: crate::VERSION.to_owned(),
+                socket_addr_v6: socket_addr_v6.clone(),
+                webrtc_sdp_answer: webrtc_sdp_answer.clone(),
+                ..Default::default()
+            };
+            match self
+                .punch_udp_predictive_hole(peer_addr, window, server.clone(), msg_punch, meta.clone(), slot)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    log::info!("predictive punch failed, falling back to relay: {}", err);
+                    let uuid = Uuid::new_v4().to_string();
+                    return self
+                        .create_relay(
+                            ph.socket_addr.into(),
+                            relay_server,
+                            uuid,
+                            server,
+                            true,
+                            true,
+                            socket_addr_v6,
+                            webrtc_sdp_answer,
+                            meta,
+                        )
+                        .await;
+                }
+            }
+        }
         let msg_punch = PunchHoleSent {
             socket_addr: ph.socket_addr,
             id: Config::get_id(),
@@ -1249,6 +1324,70 @@ impl RendezvousMediator {
             slot,
         )
         .await?;
+        Ok(())
+    }
+
+    /// Punch through a symmetric NAT by predicting the peer's external ports:
+    /// both ends sampled their own allocations, so instead of a single observed
+    /// port we probe a window past the peer's last sample from several sockets.
+    async fn punch_udp_predictive_hole(
+        &self,
+        peer_addr: SocketAddr,
+        window: std::ops::RangeInclusive<u16>,
+        server: ServerPtr,
+        mut msg_punch: PunchHoleSent,
+        meta: ConnectionMeta,
+        slot: PunchSlot,
+    ) -> ResultType<()> {
+        let host = &*self.host;
+        let mut sockets = Vec::new();
+        let mut server_addr = None;
+        for _ in 0..crate::nat_predict::SOCKETS {
+            if let Ok((socket, addr)) = new_direct_udp_for(host).await {
+                server_addr = Some(addr);
+                sockets.push(socket);
+            }
+        }
+        let Some(server_addr) = server_addr else {
+            bail!("no UDP socket for the predictive punch");
+        };
+        let mut samples = Vec::new();
+        for socket in &sockets {
+            if let Some(port) = crate::nat_predict::sample_udp_port(socket, server_addr, 1000).await
+            {
+                samples.push(port as i32);
+            }
+        }
+        if samples.is_empty() {
+            bail!("no external UDP port samples");
+        }
+        log::info!(
+            "predictive punch to {}, samples: {:?}, window: {:?}",
+            peer_addr,
+            samples,
+            window
+        );
+        msg_punch.ext_ports = samples;
+        let mut msg_out = Message::new();
+        msg_out.set_punch_hole_sent(msg_punch);
+        let data = msg_out.write_to_bytes()?;
+        // From the first socket, so the port hbbs observes is one of the samples
+        // the peer anchors its window on.
+        sockets[0].send_to(&data, server_addr).await?;
+        let Some((socket, peer, init)) =
+            crate::nat_predict::punch_udp_predictive(sockets, peer_addr.ip(), window, true).await?
+        else {
+            bail!("no predicted port carried traffic");
+        };
+        let _ = socket.connect(peer).await;
+        let stream = crate::kcp_stream::KcpStream::accept(
+            socket,
+            Duration::from_millis(CONNECT_TIMEOUT as _),
+            init,
+        )
+        .await?;
+        drop(slot);
+        crate::server::create_tcp_connection(server, stream.1, peer_addr, true, meta).await?;
         Ok(())
     }
 

@@ -489,7 +489,9 @@ impl Client {
         let udp =
         // no need to care about multiple rendezvous servers case, since it is acutally not used any more.
         // Shared state for UDP NAT test result
-        if crate::get_udp_punch_enabled() && !interface.is_force_relay() {
+        if (crate::get_udp_punch_enabled() || crate::nat_predict::enabled())
+            && !interface.is_force_relay()
+        {
             if let Ok((socket, addr)) = new_direct_udp_for_unverified(&rendezvous_server).await {
                 let udp_port = Arc::new(Mutex::new(0));
                 let up_cloned = udp_port.clone();
@@ -550,6 +552,7 @@ impl Client {
         if interface.is_force_relay()
             || (udp.0.is_none() && !has_webrtc_offerer)
             || !tcp_punch_allowed()
+            || (crate::nat_predict::enabled() && udp.0.is_some())
         {
             return fut.await;
         }
@@ -914,6 +917,19 @@ impl Client {
             .map(|(socket, addr)| (Some(socket), Some(addr)))
             .unwrap_or((None, None));
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
+        // NAT port prediction: sample one more socket so the peer can see the
+        // allocation step, and carry the samples on the request.
+        let mut extra_udp = None;
+        let mut predict_samples = Vec::new();
+        if crate::nat_predict::enabled() && udp_nat_port > 0 {
+            predict_samples.push(udp_nat_port as i32);
+            if let Ok((socket, addr)) = new_direct_udp_for_unverified(&rendezvous_server).await {
+                if let Some(port) = crate::nat_predict::sample_udp_port(&socket, addr, 1000).await {
+                    predict_samples.push(port as i32);
+                }
+                extra_udp = Some(socket);
+            }
+        }
         let webrtc_sdp_offer = webrtc_offerer
             .as_ref()
             .and_then(|g| g.stream())
@@ -957,6 +973,7 @@ impl Client {
             // pure ws), telling the controlled side its answer may gather every candidate
             // type despite force_relay instead of requiring TURN.
             webrtc_sdp_offer,
+            ext_ports: predict_samples,
             ..Default::default()
         });
         let webrtc_session_key = webrtc_offerer
@@ -966,6 +983,7 @@ impl Client {
             .unwrap_or_default();
         let mut webrtc_sdp_answer = String::new();
         let mut pending_webrtc_ice = Vec::<String>::new();
+        let mut predict: Option<crate::nat_predict::PredictCtx> = None;
         'punch_attempts: for i in 1..=3 {
             log::info!(
                 "#{} {} punch attempt with {}, id: {}",
@@ -1019,6 +1037,32 @@ impl Client {
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
                             webrtc_sdp_answer = ph.webrtc_sdp_answer;
+                            if crate::nat_predict::enabled()
+                                && ph.is_udp
+                                && (peer_nat_type == NatType::SYMMETRIC
+                                    || nat_type == NatType::SYMMETRIC)
+                            {
+                                let mut samples = ph.ext_ports.clone();
+                                samples.push(peer_addr.port() as i32);
+                                if let Some(window) =
+                                    crate::nat_predict::predict_port_window(&samples)
+                                {
+                                    let mut sockets = Vec::new();
+                                    if let Some(s) = udp.0.take() {
+                                        sockets.push(s);
+                                    }
+                                    if let Some(s) = extra_udp.take() {
+                                        sockets.push(s);
+                                    }
+                                    if !sockets.is_empty() {
+                                        predict = Some(crate::nat_predict::PredictCtx {
+                                            sockets,
+                                            peer_ip: peer_addr.ip(),
+                                            window,
+                                        });
+                                    }
+                                }
+                            }
                             let s = udp.0.take();
                             if udp_nat_port > 0 && ph.is_udp && s.is_some() {
                                 if let Some(s) = s {
@@ -1378,6 +1422,7 @@ impl Client {
                 webrtc_bridge_stop,
                 allow_tcp_punch,
                 &punch_type,
+                predict,
             )
             .await?,
             (feedback, rendezvous_server),
@@ -1407,6 +1452,7 @@ impl Client {
         webrtc_bridge_stop: Option<oneshot::Sender<()>>,
         allow_tcp_punch: bool,
         punch_type: &str,
+        predict: Option<crate::nat_predict::PredictCtx>,
     ) -> ResultType<(
         Stream,
         bool,
@@ -1421,7 +1467,7 @@ impl Client {
         let direct_failures = interface.get_lch().read().unwrap().direct_failures;
         let mut connect_timeout = 0;
         const MIN: u64 = 1000;
-        if is_local || peer_nat_type == NatType::SYMMETRIC {
+        if is_local || (peer_nat_type == NatType::SYMMETRIC && predict.is_none()) {
             connect_timeout = MIN;
         } else {
             if relay_server.is_empty() {
@@ -1466,7 +1512,15 @@ impl Client {
                 .boxed(),
             );
         }
-        if let Some(udp_socket_nat) = udp_socket_nat {
+        if let Some(predict) = predict {
+            direct_futures.push(
+                async move {
+                    let (conn, kcp, typ) = udp_predict_connect(predict).await?;
+                    Ok((conn, kcp, typ, true))
+                }
+                .boxed(),
+            );
+        } else if let Some(udp_socket_nat) = udp_socket_nat {
             direct_futures.push(
                 async move {
                     let (conn, kcp, typ) =
@@ -5549,6 +5603,29 @@ async fn udp_nat_connect(
             anyhow!(err)
         })?;
     Ok((res.1, Some(res.0), typ))
+}
+
+async fn udp_predict_connect(
+    predict: crate::nat_predict::PredictCtx,
+) -> ResultType<(Stream, Option<KcpStream>, &'static str)> {
+    let Some((socket, peer, _)) = crate::nat_predict::punch_udp_predictive(
+        predict.sockets,
+        predict.peer_ip,
+        predict.window,
+        false,
+    )
+    .await?
+    else {
+        bail!("predictive punch failed");
+    };
+    socket.connect(peer).await?;
+    let res = KcpStream::connect(socket, Duration::from_millis(CONNECT_TIMEOUT))
+        .await
+        .map_err(|err| {
+            log::debug!("Failed to connect KCP stream after predictive punch: {}", err);
+            anyhow!(err)
+        })?;
+    Ok((res.1, Some(res.0), "UDP"))
 }
 
 #[cfg(test)]

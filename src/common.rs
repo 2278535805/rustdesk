@@ -2727,18 +2727,18 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
 // probe. The punch it replaces sent a zero-length datagram and called the hole open on whatever
 // arrived next - which the rendezvous NAT test's own leftover replies satisfied instantly, so the
 // retry loop below never actually ran and its success meant nothing.
-const PUNCH_PROBE: [u8; 4] = *b"RDP?";
-const PUNCH_ACK: [u8; 4] = *b"RDP!";
-const PUNCH_PACKET_LEN: usize = 12;
+pub(crate) const PUNCH_PROBE: [u8; 4] = *b"RDP?";
+pub(crate) const PUNCH_ACK: [u8; 4] = *b"RDP!";
+pub(crate) const PUNCH_PACKET_LEN: usize = 12;
 
-fn punch_packet(tag: &[u8; 4], tid: u64) -> [u8; PUNCH_PACKET_LEN] {
+pub(crate) fn punch_packet(tag: &[u8; 4], tid: u64) -> [u8; PUNCH_PACKET_LEN] {
     let mut packet = [0u8; PUNCH_PACKET_LEN];
     packet[..4].copy_from_slice(tag);
     packet[4..].copy_from_slice(&tid.to_le_bytes());
     packet
 }
 
-fn punch_tid(packet: &[u8], tag: &[u8; 4]) -> Option<u64> {
+pub(crate) fn punch_tid(packet: &[u8], tag: &[u8; 4]) -> Option<u64> {
     if packet.len() != PUNCH_PACKET_LEN || packet[..4] != tag[..] {
         return None;
     }

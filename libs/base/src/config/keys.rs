@@ -131,6 +131,7 @@ pub const OPTION_ENABLE_UDP_PUNCH: &str = "enable-udp-punch";
 pub const OPTION_ENABLE_IPV6_PUNCH: &str = "enable-ipv6-punch";
 pub const OPTION_ENABLE_PORT_FORWARD_MUX: &str = "enable-port-forward-mux";
 pub const OPTION_ENABLE_WEBRTC: &str = "enable-webrtc";
+pub const OPTION_ENABLE_NAT_PREDICTION: &str = "enable-nat-prediction";
 pub const OPTION_RELAY_FALLBACK_DELAY: &str = "relay-fallback-delay";
 pub const OPTION_ALLOW_KCP_CC: &str = "allow-kcp-congestion-control";
 pub const OPTION_HIDE_USERNAME_ON_CARD: &str = "hide-username-on-card";
@@ -325,6 +326,7 @@ pub const KEYS_SETTINGS: &[&str] = &[
     OPTION_RELAY_SERVER,
     OPTION_ICE_SERVERS,
     OPTION_DISABLE_UDP,
+    OPTION_ENABLE_NAT_PREDICTION,
     OPTION_ALLOW_INSECURE_TLS_FALLBACK,
     OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
     OPTION_ALLOW_AUTO_UPDATE,
